@@ -9,7 +9,6 @@ use prefix::{Name, Prefix};
 use random;
 use std::fmt;
 use std::mem;
-use std::u64;
 
 pub struct Section {
     prefix: Prefix,
@@ -277,8 +276,10 @@ impl Section {
             "no Live block in the chain",
         );
 
+        let mut nodes = self.nodes.values().cloned().collect::<Vec<_>>();
+        nodes.sort_unstable_by_key(|node| node.age());
         for _ in 0..params.max_relocation_attempts {
-            if let Some(name) = self.check_relocate(params, &hash) {
+            if let Some(name) = self.check_relocate(params, &hash, &nodes) {
                 return self.relocate(name);
             } else {
                 hash = hash.hash();
@@ -288,30 +289,14 @@ impl Section {
         Vec::new()
     }
 
-    fn check_relocate(&self, params: &Params, hash: &Hash) -> Option<Name> {
-        // Find the youngest node for which `hash % 2^age == 0`. If there is
-        // more than one, apply the tie-breaking rule.
+    fn check_relocate(&self, params: &Params, hash: &Hash, nodes: &Vec<Node>) -> Option<Name> {
+        // Find the youngest or oldest node depending on the `RelocationStrategy` for which
+        // `hash % 2^age == 0`. If there is more than one, apply the tie-breaking rule.
 
-        let mut candidates = self.relocation_candidates(params, hash);
+        let candidates = self.relocation_candidates(params, hash, nodes);
         if candidates.is_empty() {
             return None;
         }
-
-        match params.relocation_strategy {
-            RelocationStrategy::YoungestFirst => {
-                candidates.sort_by_key(|node| node.age());
-            }
-            RelocationStrategy::OldestFirst => {
-                candidates.sort_by_key(|node| u64::MAX - node.age());
-            }
-        }
-
-        let age = candidates[0].age();
-        let index = candidates
-            .iter()
-            .position(|node| node.age() > age)
-            .unwrap_or(candidates.len());
-        candidates.truncate(index);
 
         if candidates.len() == 1 {
             Some(candidates[0].name())
@@ -320,26 +305,29 @@ impl Section {
         }
     }
 
-    fn relocation_candidates(&self, _params: &Params, hash: &Hash) -> Vec<&Node> {
-        // Formula: `hash % 2^age == 0`
-
-        // let hash = BigUint::from_bytes_le(&hash[..]);
-        // let two = BigUint::from(2u32);
-        // let zero = BigUint::from(0u32);
-
-        // self.nodes
-        //     .values()
-        //     .filter(|node| {
-        //         hash.clone() % pow(two.clone(), node.age() as usize) == zero
-        //     })
-        //     .collect()
-
-        // This is equivalent but more efficient:
+    fn relocation_candidates<'a>(
+        &self,
+        params: &Params,
+        hash: &Hash,
+        nodes: &'a Vec<Node>,
+    ) -> Vec<&'a Node> {
         let trailing_zeros = hash.trailing_zeros();
-        self.nodes
-            .values()
-            .filter(|node| node.age() <= trailing_zeros)
-            .collect()
+        let mut current_age = 0;
+        let mut candidates = vec![];
+        for node in nodes {
+            if node.age() > trailing_zeros {
+                break;
+            }
+            if node.age() != current_age {
+                match params.relocation_strategy {
+                    RelocationStrategy::YoungestFirst => break,
+                    RelocationStrategy::OldestFirst => candidates.clear(),
+                }
+            }
+            current_age = node.age();
+            candidates.push(node);
+        }
+        candidates
     }
 
     fn relocate(&mut self, name: Name) -> Vec<Response> {
@@ -431,10 +419,18 @@ impl Section {
 impl fmt::Debug for Section {
     fn fmt(&self, fmt: &mut fmt::Formatter) -> fmt::Result {
         write!(fmt, "Section({})", self.prefix)
+        // writeln!(fmt, "Section{{ Prefix({}), {:?}", self.prefix, self.state)?;
+        // writeln!(fmt, "    requests: {:?}", self.requests)?;
+        // writeln!(fmt, "    nodes: {{")?;
+        // for node in self.nodes.values() {
+        //     writeln!(fmt, "        {:?}", node)?;
+        // }
+        // writeln!(fmt, "    }}")?;
+        // writeln!(fmt, "}}")
     }
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Eq, PartialEq, Debug)]
 enum State {
     Stable,
     Splitting,
